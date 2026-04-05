@@ -65,10 +65,16 @@ rs encode photo.jpg --data 4 --parity 2 --out shards/
 
 ```
 rs decode <output_file> <shard1> [shard2 …]
+rs decode <output_file> -
 ```
 
 Provide **at least K** shard files. Shards may be in any order and their
 indices do not need to be contiguous — any K-subset works.
+
+With **`decode <out> -`**, read **exactly K** shard files from **stdin**, one after
+another (e.g. `cat shard000 shard002 … | rs decode out -`). Each shard must be
+the full on-disk format (magic + header + payload); payload size is taken from
+the header so there is no per-shard size limit.
 
 **Example** (two shards lost, any 4 survive)
 

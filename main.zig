@@ -2,8 +2,8 @@
 // Systematic (k,n) RS over GF(2^8) — any k of n shards recover the file.
 //
 // Usage:
-//   rs encode <file> [--data K] [--parity M] [--out DIR]
-//   rs decode <output> <shard1> [shard2 …]
+//   rs encode <file|-> [--data K] [--parity M] [--out DIR]
+//   rs decode <output> <shard…|->   (- = k concatenated shard blobs on stdin)
 //   rs info   <shard> [shard …]
 
 const std = @import("std");
@@ -274,17 +274,211 @@ const ShardHeader = struct {
     file_size: u64,
 };
 
-fn writeShardFile(path: []const u8, hdr: ShardHeader, data: []const u8) !void {
-    const f = try std.fs.cwd().createFile(path, .{});
-    defer f.close();
-    const w = f.deprecatedWriter();
+fn writeShardHeader(w: anytype, hdr: ShardHeader) !void {
     try w.writeAll(&MAGIC);
     try w.writeByte(hdr.k);
     try w.writeByte(hdr.m);
     try w.writeByte(hdr.index);
     try w.writeByte(0); // reserved
     try w.writeInt(u64, hdr.file_size, .little);
+}
+
+fn writeShardFile(path: []const u8, hdr: ShardHeader, data: []const u8) !void {
+    const f = try std.fs.cwd().createFile(path, .{});
+    defer f.close();
+    const w = f.deprecatedWriter();
+    try writeShardHeader(&w, hdr);
     try w.writeAll(data);
+}
+
+/// Larger inputs use two-pass streaming (no full-file RAM). Smaller files stay in memory for speed.
+const max_encode_memory: usize = 1 << 30;
+const stream_chunk: usize = 64 * 1024;
+
+fn copyFileBytes(out: std.fs.File, buf: []u8, mut_in: *std.fs.File, count: u64) !void {
+    var left = count;
+    while (left > 0) {
+        const n: usize = @intCast(@min(left, buf.len));
+        const got = try mut_in.readAll(buf[0..n]);
+        if (got != n) return error.UnexpectedEndOfFile;
+        try out.writeAll(buf[0..n]);
+        left -= n;
+    }
+}
+
+fn writeZeroPad(out: std.fs.File, len: usize, buf: []u8) !void {
+    @memset(buf, 0);
+    var left = len;
+    while (left > 0) {
+        const n = @min(left, buf.len);
+        try out.writeAll(buf[0..n]);
+        left -= n;
+    }
+}
+
+/// Pass 1: split input into k data shard files (with headers). Pass 2: derive parity shards.
+fn encodeStreaming(
+    alloc: Allocator,
+    in: *std.fs.File,
+    file_size: u64,
+    k: usize,
+    m: usize,
+    out_dir: []const u8,
+    base: []const u8,
+    stdout: *std.Io.Writer,
+) !void {
+    const n = k + m;
+    const shard_sz: usize = @intCast((file_size + @as(u64, @intCast(k)) - 1) / @as(u64, @intCast(k)));
+    const shard_sz_u64: u64 = @intCast(shard_sz);
+
+    gfInit();
+    var rs = try RS.init(alloc, k, m);
+    defer rs.deinit();
+
+    var path_buf: [1024]u8 = undefined;
+
+    // --- Pass 1: data shards ---
+    var data_files: [255]std.fs.File = undefined;
+    defer for (0..k) |j| data_files[j].close();
+
+    for (0..k) |j| {
+        const shard_path = try std.fmt.bufPrint(
+            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, j });
+        data_files[j] = try std.fs.cwd().createFile(shard_path, .{});
+        const hdr = ShardHeader{
+            .k = @intCast(k),
+            .m = @intCast(m),
+            .index = @intCast(j),
+            .file_size = file_size,
+        };
+        const w = data_files[j].deprecatedWriter();
+        try writeShardHeader(&w, hdr);
+    }
+
+    const copy_buf = try alloc.alloc(u8, stream_chunk);
+    defer alloc.free(copy_buf);
+
+    var j: usize = 0;
+    while (j < k) : (j += 1) {
+        const base_off: u64 = @as(u64, @intCast(j)) * shard_sz_u64;
+        if (base_off >= file_size) {
+            try writeZeroPad(data_files[j], shard_sz, copy_buf);
+            continue;
+        }
+        const take: u64 = @min(shard_sz_u64, file_size - base_off);
+        try in.seekTo(base_off);
+        try copyFileBytes(data_files[j], copy_buf, in, take);
+        if (take < shard_sz_u64) {
+            try writeZeroPad(data_files[j], @intCast(shard_sz_u64 - take), copy_buf);
+        }
+    }
+
+    // `createFile` may be write-only; pass 2 must read data shards — reopen for reading.
+    for (0..k) |jj| {
+        data_files[jj].close();
+        const shard_path = try std.fmt.bufPrint(
+            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, jj });
+        data_files[jj] = try std.fs.cwd().openFile(shard_path, .{});
+    }
+
+    // --- Pass 2: parity shards (column chunks) ---
+    var parity_files: [255]std.fs.File = undefined;
+    defer for (0..m) |t| parity_files[t].close();
+
+    for (0..m) |t| {
+        const pi = k + t;
+        const shard_path = try std.fmt.bufPrint(
+            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, pi });
+        parity_files[t] = try std.fs.cwd().createFile(shard_path, .{});
+        const hdr = ShardHeader{
+            .k = @intCast(k),
+            .m = @intCast(m),
+            .index = @intCast(pi),
+            .file_size = file_size,
+        };
+        const w = parity_files[t].deprecatedWriter();
+        try writeShardHeader(&w, hdr);
+    }
+
+    var col = try alloc.alloc([]u8, k);
+    for (0..k) |jj| {
+        col[jj] = try alloc.alloc(u8, stream_chunk);
+    }
+    defer {
+        for (col) |sl| alloc.free(sl);
+        alloc.free(col);
+    }
+
+    var out_par = try alloc.alloc([]u8, m);
+    for (0..m) |tt| {
+        out_par[tt] = try alloc.alloc(u8, stream_chunk);
+    }
+    defer {
+        for (out_par) |sl| alloc.free(sl);
+        alloc.free(out_par);
+    }
+
+    var p: usize = 0;
+    while (p < shard_sz) {
+        const csize: usize = @min(stream_chunk, shard_sz - p);
+        for (0..k) |jj| {
+            try data_files[jj].seekTo(16 + @as(u64, @intCast(p)));
+            _ = try data_files[jj].readAll(col[jj][0..csize]);
+        }
+        for (0..csize) |off| {
+            var tt: usize = 0;
+            while (tt < m) : (tt += 1) {
+                const pi = k + tt;
+                var acc: u8 = 0;
+                var jj: usize = 0;
+                while (jj < k) : (jj += 1) {
+                    const c = rs.enc.get(pi, jj);
+                    if (c != 0) acc ^= gfMul(c, col[jj][off]);
+                }
+                out_par[tt][off] = acc;
+            }
+        }
+        for (0..m) |tt| {
+            try parity_files[tt].writeAll(out_par[tt][0..csize]);
+        }
+        p += csize;
+    }
+
+    try stdout.print("\n", .{});
+    for (0..n) |si| {
+        const shard_path = try std.fmt.bufPrint(
+            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, si });
+        const kind = if (si < k) "data  " else "parity";
+        try stdout.print("  [{s}] {s}\n", .{ kind, shard_path });
+    }
+
+    var sz_buf1: [32]u8 = undefined;
+    var sz_buf2: [32]u8 = undefined;
+    try stdout.print(
+        \\
+        \\  Source   : {s}  ({s})
+        \\  Shards   : {d} total ({d} data + {d} parity), {s} each
+        \\  Recovery : any {d} of {d} shards reconstruct the file
+        \\
+    , .{
+        base,
+        fmtSize(&sz_buf1, file_size),
+        n, k, m,
+        fmtSize(&sz_buf2, shard_sz),
+        k, n,
+    });
+}
+
+fn spoolStdinToPath(path: []const u8) !void {
+    const out = try std.fs.cwd().createFile(path, .{});
+    defer out.close();
+    const stdin = std.fs.File.stdin();
+    var buf: [8 * 1024 * 1024]u8 = undefined;
+    while (true) {
+        const n = try stdin.read(&buf);
+        if (n == 0) break;
+        try out.writeAll(buf[0..n]);
+    }
 }
 
 const ShardFile = struct {
@@ -297,28 +491,37 @@ const ShardFile = struct {
     }
 };
 
-fn readShardFile(alloc: Allocator, path: []const u8) !ShardFile {
-    const f = try std.fs.cwd().openFile(path, .{});
-    defer f.close();
-    const r = f.deprecatedReader();
-
+fn readShardFromReader(alloc: Allocator, r: anytype) !ShardFile {
     var magic: [4]u8 = undefined;
     try r.readNoEof(&magic);
     if (!std.mem.eql(u8, &magic, &MAGIC)) return error.InvalidMagic;
 
-    const k     = try r.readByte();
-    const m     = try r.readByte();
+    const kb = try r.readByte();
+    const mb = try r.readByte();
     const index = try r.readByte();
-    _           = try r.readByte(); // reserved
-    const fsz   = try r.readInt(u64, .little);
+    _ = try r.readByte(); // reserved
+    const fsz = try r.readInt(u64, .little);
 
-    // 256 MiB per-shard cap — increase if needed
-    const data = try r.readAllAlloc(alloc, 256 * 1024 * 1024);
+    const kk: usize = @intCast(kb);
+    if (kk == 0) return error.InvalidParams;
+    const shard_sz: usize = @intCast((fsz + @as(u64, @intCast(kk)) - 1) / @as(u64, @intCast(kk)));
+
+    const data = try alloc.alloc(u8, shard_sz);
+    errdefer alloc.free(data);
+    try r.readNoEof(data);
+
     return ShardFile{
-        .hdr  = .{ .k = k, .m = m, .index = index, .file_size = fsz },
+        .hdr = .{ .k = kb, .m = mb, .index = index, .file_size = fsz },
         .data = data,
         .alloc = alloc,
     };
+}
+
+fn readShardFile(alloc: Allocator, path: []const u8) !ShardFile {
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    var r = f.deprecatedReader();
+    return readShardFromReader(alloc, &r);
 }
 
 // ============================================================================
@@ -341,11 +544,12 @@ fn fmtSize(buf: []u8, bytes: u64) []const u8 {
 
 fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     var stderr = std.fs.File.stderr().writer(&.{});
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout_file = std.fs.File.stdout().writer(&.{});
+    var stdout: *std.Io.Writer = &stdout_file.interface;
 
     if (argv.len == 0) {
         try stderr.interface.print(
-            "Usage: rs encode <file> [--data K] [--parity M] [--out DIR]\n", .{});
+            "Usage: rs encode <file|-> [--data K] [--parity M] [--out DIR]\n   (- reads stdin; spools then encodes; >1GiB files use streaming)\n", .{});
         return error.InvalidArgs;
     }
 
@@ -396,52 +600,80 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
         return error.InvalidArgs;
     }
 
-    // ── Read source ──────────────────────────────────────────────────────────
-    const raw = std.fs.cwd().readFileAlloc(alloc, src_path, 1 << 30) catch |err| {
-        try stderr.interface.print("Cannot read '{s}': {}\n", .{ src_path, err });
+    try std.fs.cwd().makePath(out_dir);
+
+    var stdin_tmp: ?[]u8 = null;
+    defer if (stdin_tmp) |p| {
+        std.fs.cwd().deleteFile(p) catch {};
+        alloc.free(p);
+    };
+
+    var input_path: []const u8 = src_path;
+    if (std.mem.eql(u8, src_path, "-")) {
+        const tmp = try std.fmt.allocPrint(alloc, "{s}/.rs-encode-{x}.tmp", .{ out_dir, std.time.nanoTimestamp() });
+        stdin_tmp = tmp;
+        spoolStdinToPath(tmp) catch |err| {
+            try stderr.interface.print("Cannot spool stdin: {}\n", .{err});
+            return err;
+        };
+        input_path = tmp;
+    }
+
+    var in_file = std.fs.cwd().openFile(input_path, .{}) catch |err| {
+        try stderr.interface.print("Cannot open '{s}': {}\n", .{ input_path, err });
         return err;
     };
-    defer alloc.free(raw);
+    defer in_file.close();
 
-    if (raw.len == 0) {
-        try stderr.interface.print("Input file '{s}' is empty.\n", .{src_path});
+    const file_size = try in_file.getEndPos();
+    if (file_size == 0) {
+        try stderr.interface.print("Input is empty.\n", .{});
         return error.EmptyInput;
     }
 
-    const file_size = raw.len;
-    const shard_sz  = (file_size + k - 1) / k; // ceiling division
+    const base = if (std.mem.eql(u8, src_path, "-")) "stdin" else std.fs.path.basename(src_path);
+    const label = if (std.mem.eql(u8, src_path, "-")) "-" else src_path;
+
+    if (file_size > max_encode_memory) {
+        try in_file.seekTo(0);
+        try encodeStreaming(alloc, &in_file, file_size, k, m, out_dir, base, stdout);
+        return;
+    }
+
+    try in_file.seekTo(0);
+    const raw = try in_file.readToEndAlloc(alloc, max_encode_memory);
+    defer alloc.free(raw);
+    if (raw.len != file_size) {
+        try stderr.interface.print("Short read (expected {d} bytes, got {d}).\n", .{ file_size, raw.len });
+        return error.UnexpectedEndOfFile;
+    }
+
+    const file_size_usize: usize = @intCast(file_size);
+    const shard_sz = (file_size_usize + k - 1) / k;
     const padded_sz = shard_sz * k;
 
-    // Zero-padded buffer
     var padded = try alloc.alloc(u8, padded_sz);
     defer alloc.free(padded);
-    @memcpy(padded[0..file_size], raw);
-    if (file_size < padded_sz) @memset(padded[file_size..], 0);
+    @memcpy(padded[0..file_size_usize], raw);
+    if (file_size_usize < padded_sz) @memset(padded[file_size_usize..], 0);
 
-    // Views into padded buffer for the data shards
     var data_views = try alloc.alloc([]const u8, k);
     defer alloc.free(data_views);
     for (0..k) |si| data_views[si] = padded[si * shard_sz .. (si + 1) * shard_sz];
 
-    // Allocate output shard buffers
     const n = k + m;
     var out_bufs = try alloc.alloc([]u8, n);
     defer alloc.free(out_bufs);
     for (0..n) |si| out_bufs[si] = try alloc.alloc(u8, shard_sz);
     defer for (out_bufs) |sb| alloc.free(sb);
 
-    // ── Encode ───────────────────────────────────────────────────────────────
     gfInit();
     var rs = try RS.init(alloc, k, m);
     defer rs.deinit();
     rs.encode(data_views, out_bufs);
 
-    // ── Write shards ─────────────────────────────────────────────────────────
-    try std.fs.cwd().makePath(out_dir);
-    const base = std.fs.path.basename(src_path);
     var path_buf: [1024]u8 = undefined;
-
-    try stdout.interface.print("\n", .{});
+    try stdout.print("\n", .{});
     for (0..n) |si| {
         const shard_path = try std.fmt.bufPrint(
             &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, si });
@@ -449,23 +681,23 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
             .k         = @intCast(k),
             .m         = @intCast(m),
             .index     = @intCast(si),
-            .file_size = @intCast(file_size),
+            .file_size = file_size,
         };
         try writeShardFile(shard_path, hdr, out_bufs[si]);
         const kind = if (si < k) "data  " else "parity";
-        try stdout.interface.print("  [{s}] {s}\n", .{ kind, shard_path });
+        try stdout.print("  [{s}] {s}\n", .{ kind, shard_path });
     }
 
     var sz_buf1: [32]u8 = undefined;
     var sz_buf2: [32]u8 = undefined;
-    try stdout.interface.print(
+    try stdout.print(
         \\
         \\  Source   : {s}  ({s})
         \\  Shards   : {d} total ({d} data + {d} parity), {s} each
         \\  Recovery : any {d} of {d} shards reconstruct the file
         \\
     , .{
-        src_path,
+        label,
         fmtSize(&sz_buf1, file_size),
         n, k, m,
         fmtSize(&sz_buf2, shard_sz),
@@ -483,25 +715,52 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
 
     if (argv.len < 2) {
         try stderr.interface.print(
-            "Usage: rs decode <output_file> <shard1> [shard2 …]\n", .{});
+            "Usage: rs decode <output_file> <shard|-> [shard …]\n" ++
+                "  Last arg may be paths to k shards, or a lone '-' to read k\n" ++
+                "  concatenated shard files from stdin (any order; each has a header).\n", .{});
         return error.InvalidArgs;
     }
 
-    const dst_path    = argv[0];
-    const shard_paths = argv[1..];
+    const dst_path = argv[0];
 
-    // ── Read shards ───────────────────────────────────────────────────────────
-    var shards = try alloc.alloc(ShardFile, shard_paths.len);
-    defer alloc.free(shards);
+    var shards: []ShardFile = undefined;
     var n_read: usize = 0;
-    defer for (shards[0..n_read]) |*s| s.deinit();
+    defer {
+        if (n_read > 0) {
+            for (shards[0..n_read]) |*s| s.deinit();
+            alloc.free(shards);
+        }
+    }
 
-    for (shard_paths) |p| {
-        shards[n_read] = readShardFile(alloc, p) catch |err| {
-            try stderr.interface.print("Cannot read shard '{s}': {}\n", .{ p, err });
+    if (argv.len == 2 and std.mem.eql(u8, argv[1], "-")) {
+        var stdin_reader = std.fs.File.stdin().deprecatedReader();
+        const first = readShardFromReader(alloc, &stdin_reader) catch |err| {
+            try stderr.interface.print("Cannot read shards from stdin: {}\n", .{err});
             return err;
         };
-        n_read += 1;
+        const k0: usize = @intCast(first.hdr.k);
+        shards = try alloc.alloc(ShardFile, k0);
+        shards[0] = first;
+        n_read = 1;
+        var ii: usize = 1;
+        while (ii < k0) : (ii += 1) {
+            shards[ii] = readShardFromReader(alloc, &stdin_reader) catch |err| {
+                try stderr.interface.print("Cannot read shard {d} from stdin: {}\n", .{ ii, err });
+                return err;
+            };
+            n_read = ii + 1;
+        }
+    } else {
+        const shard_paths = argv[1..];
+        shards = try alloc.alloc(ShardFile, shard_paths.len);
+        n_read = 0;
+        for (shard_paths) |p| {
+            shards[n_read] = readShardFile(alloc, p) catch |err| {
+                try stderr.interface.print("Cannot read shard '{s}': {}\n", .{ p, err });
+                return err;
+            };
+            n_read += 1;
+        }
     }
 
     // ── Validate compatibility ────────────────────────────────────────────────
@@ -721,8 +980,8 @@ const HELP =
     \\Reed-Solomon erasure codec — split any file into recoverable shards.
     \\
     \\COMMANDS
-    \\  encode <file> [options]        Split a file into n shards
-    \\  decode <output> <shard> …      Recover a file from ≥k shards
+    \\  encode <file|-> [options]      Split a file into n shards (- = stdin; >1GiB streams)
+    \\  decode <output> <shard…|->     Recover from ≥k shards (see below)
     \\  info   <shard> …               Print shard metadata
     \\  verify <shard> …               Re-encode & compare parity (needs all n)
     \\  help                           Show this help
@@ -731,7 +990,7 @@ const HELP =
     \\  --data   K   Data shards   (default 6; min 1)
     \\  --parity M   Parity shards (default 4; min 1)
     \\  --out    DIR Output directory for shard files (default .)
-    \\  k+m must be ≤ 255.
+    \\  k+m must be ≤ 255. Inputs larger than 1 GiB use a disk streaming encoder.
     \\
     \\SHARD FILES
     \\  Named <original_filename>.shard000, .shard001, …
@@ -744,6 +1003,7 @@ const HELP =
     \\  # Encode with custom params (3-of-5)
     \\  rs encode archive.tar.gz --data 3 --parity 2 --out /mnt/backup
     \\
+    \\  # Or pipe exactly k shard files (binary concat): cat a b c | rs decode out -
     \\  # Recover using any 3 shards (indices can be non-contiguous)
     \\  rs decode archive.tar.gz /mnt/backup/archive.tar.gz.shard000 \
     \\                           /mnt/backup/archive.tar.gz.shard002 \
