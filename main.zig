@@ -911,13 +911,14 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
     var stdout = std.fs.File.stdout().writer(&.{});
 
     if (argv.len < 2) {
-        try stderr.interface.print("Usage: rs decode <output_file> <shard|-> [shard …]\n" ++
-            "  Last arg may be paths to k shards, or a lone '-' to read k\n" ++
-            "  concatenated shard files from stdin (any order; each has a header).\n", .{});
+        try stderr.interface.print("Usage: rs decode <output_file|-> <shard|-> [shard …]\n" ++
+            "  Use '-' as output to write decoded bytes to stdout (pipe-friendly, e.g. | gunzip).\n" ++
+            "  Shard args: paths to k shards, or a lone '-' to read k concatenated shards from stdin.\n", .{});
         return error.InvalidArgs;
     }
 
     const dst_path = argv[0];
+    const out_to_stdout = std.mem.eql(u8, dst_path, "-");
 
     var shards: []ShardFile = undefined;
     var n_read: usize = 0;
@@ -1026,17 +1027,24 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
     for (0..k) |i| @memcpy(assembled[i * shard_sz .. (i + 1) * shard_sz], out_bufs[i]);
 
     const actual = @min(file_size, padded_sz);
-    {
+    if (out_to_stdout) {
+        try std.fs.File.stdout().writeAll(assembled[0..actual]);
+    } else {
         const f = try std.fs.cwd().createFile(dst_path, .{});
         defer f.close();
         try f.writeAll(assembled[0..actual]);
     }
 
     var sz_buf: [32]u8 = undefined;
+    const msg_out = if (out_to_stdout) &stderr.interface else &stdout.interface;
     if (n_read > k) {
-        try stdout.interface.print("Note: {d} shards provided; using first {d}.\n", .{ n_read, k });
+        try msg_out.print("Note: {d} shards provided; using first {d}.\n", .{ n_read, k });
     }
-    try stdout.interface.print("Decoded '{s}' ({s}).\n", .{ dst_path, fmtSize(&sz_buf, actual) });
+    if (out_to_stdout) {
+        try stderr.interface.print("Decoded to stdout ({s}).\n", .{fmtSize(&sz_buf, actual)});
+    } else {
+        try stdout.interface.print("Decoded '{s}' ({s}).\n", .{ dst_path, fmtSize(&sz_buf, actual) });
+    }
 }
 
 // ============================================================================
@@ -1174,7 +1182,7 @@ const HELP =
     \\
     \\COMMANDS
     \\  encode <file|-> [options]      Split a file into n shards (- = stdin; >1GiB streams)
-    \\  decode <output> <shard…|->     Recover from ≥k shards (see below)
+    \\  decode <output|-> <shard…|->   Recover from ≥k shards ('-' = stdout or stdin shards)
     \\  info   <shard> …               Print shard metadata
     \\  verify <shard> …               Re-encode & compare parity (needs all n)
     \\  help                           Show this help
@@ -1198,6 +1206,8 @@ const HELP =
     \\  rs encode archive.tar.gz --data 3 --parity 2 --out /mnt/backup
     \\
     \\  # Or pipe exactly k shard files (binary concat): cat a b c | rs decode out -
+    \\  # Pipe decoded bytes to gunzip (output '-' is stdout; messages go to stderr):
+    \\  #   cat a b c | rs decode - - | gunzip -c > original.bin
     \\  # Recover using any 3 shards (indices can be non-contiguous)
     \\  rs decode archive.tar.gz /mnt/backup/archive.tar.gz.shard000 \
     \\                           /mnt/backup/archive.tar.gz.shard002 \
