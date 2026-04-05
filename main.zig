@@ -10,6 +10,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+pub const version = "0.1.0";
+
 // ============================================================================
 // GF(2^8) — primitive polynomial x^8+x^4+x^3+x^2+1  (0x11D)
 // ============================================================================
@@ -1176,6 +1178,7 @@ const HELP =
     \\  info   <shard> …               Print shard metadata
     \\  verify <shard> …               Re-encode & compare parity (needs all n)
     \\  help                           Show this help
+    \\  version, --version, -V        Print version
     \\
     \\ENCODE OPTIONS
     \\  --data   K   Data shards   (default 6; min 1)
@@ -1254,6 +1257,11 @@ pub fn main() !void {
         std.mem.eql(u8, cmd, "-h"))
     {
         try stdout.interface.print("{s}\n", .{HELP});
+    } else if (std.mem.eql(u8, cmd, "version") or
+        std.mem.eql(u8, cmd, "--version") or
+        std.mem.eql(u8, cmd, "-V"))
+    {
+        try stdout.interface.print("rs {s}\n", .{version});
     } else {
         try stderr.interface.print("Unknown command '{s}'. Run 'rs help' for usage.\n", .{cmd});
         std.process.exit(1);

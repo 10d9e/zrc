@@ -1,5 +1,7 @@
 # rs — Reed-Solomon erasure codec
 
+**Latest release: [v0.1.0](CHANGELOG.md)** — `rs version` / `rs --version`
+
 A fully self-contained command-line tool written in Zig that splits any file
 into **n = k + m** shards using a systematic Reed-Solomon code over GF(2⁸).
 Any **k** of the **n** shards are sufficient to reconstruct the original file.
@@ -24,7 +26,7 @@ dd if=/dev/zero of=testfile.bin bs=1M count=10
 sha256 testfile.bin && sha256 testfile.bin.recovered
 ```
 
-Requires **Zig 0.13** or later.
+Requires **Zig 0.15** or later.
 
 ---
 
