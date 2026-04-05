@@ -10,7 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-pub const version = "0.1.0";
+pub const version = "0.1.1";
 
 // ============================================================================
 // GF(2^8) — primitive polynomial x^8+x^4+x^3+x^2+1  (0x11D)

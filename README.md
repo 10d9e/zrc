@@ -1,6 +1,6 @@
 # rs — reed-solomon erasure codec
 
-**Latest release: [v0.1.0](CHANGELOG.md)** — `rs version` / `rs --version`
+**Latest release: [v0.1.1](CHANGELOG.md)** — `rs version` / `rs --version`
 
 A fully self-contained command-line tool written in Zig that splits any file
 into **n = k + m** shards using a systematic Reed-Solomon code over GF(2⁸).
