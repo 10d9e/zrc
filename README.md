@@ -1,4 +1,4 @@
-# rs — Reed-Solomon erasure codec
+# rs — reed-solomon erasure codec
 
 **Latest release: [v0.1.0](CHANGELOG.md)** — `rs version` / `rs --version`
 
@@ -18,15 +18,24 @@ zig build e2e                    # CLI e2e: sizes 10 MiB–1 GiB, encode/decode 
 zig build e2e -De2e-quick=true   # e2e: only 10 MiB and 100 MiB
 ```
 
+Requires **Zig 0.15** or later.
+
 ## Quickstart
 ```sh
 dd if=/dev/zero of=testfile.bin bs=1M count=10
 ./zig-out/bin/rs encode testfile.bin --data 4 --parity 2 --out shards/
 ./zig-out/bin/rs decode testfile.bin.recovered shards/testfile.bin.shard000 shards/testfile.bin.shard001 shards//testfile.bin.shard002 shards//testfile.bin.shard005
-sha256 testfile.bin && sha256 testfile.bin.recovered
+sha256sum testfile.bin && sha256sum testfile.bin.recovered
 ```
 
-Requires **Zig 0.15** or later.
+Note: for files larger than 1 GB, use streaming/piped mode:
+
+```sh
+dd if=/dev/zero of=testfile.bin bs=1G count=5
+cat testfile.bin | ./zig-out/bin/rs encode - --data 4 --parity 2 --out shards/
+cat shards/stdin.shard000 shards/stdin.shard001 shards/stdin.shard002 shards/stdin.shard005 | ./zig-out/bin/rs decode testfile.bin.recovered -
+sha256sum testfile.bin && sha256sum testfile.bin.recovered
+```
 
 ---
 
