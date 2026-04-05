@@ -172,5 +172,3 @@ MiB/s on modern hardware even in Zig's debug build.
 ## Limits
 
 - Maximum total shards: **255** (GF(2⁸) has 255 non-zero elements).
-- Maximum file size: **1 GiB** (adjustable via the `readFileAlloc` cap).
-- Maximum shard data size: **256 MiB** per shard.
