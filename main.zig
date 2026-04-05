@@ -7,7 +7,11 @@
 //   rs info   <shard> [shard …]
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+
+/// Hot buffers (matrices, shard bytes) use cache-line-friendly alignment for SIMD / prefetch.
+const codec_align = std.mem.Alignment.@"64";
 
 // ============================================================================
 // GF(2^8) — primitive polynomial x^8+x^4+x^3+x^2+1  (0x11D)
@@ -49,11 +53,11 @@ inline fn gfInv(a: u8) u8 {
 const Matrix = struct {
     rows: usize,
     cols: usize,
-    buf: []u8,
+    buf: []align(codec_align.toByteUnits()) u8,
     alloc: Allocator,
 
     fn create(alloc: Allocator, rows: usize, cols: usize) !Matrix {
-        const buf = try alloc.alloc(u8, rows * cols);
+        const buf = try alloc.alignedAlloc(u8, codec_align, rows * cols);
         @memset(buf, 0);
         return .{ .rows = rows, .cols = cols, .buf = buf, .alloc = alloc };
     }
@@ -194,23 +198,35 @@ const RS = struct {
 
     /// Encode k data shards into n shards.
     /// `data[0..k]` and `out[0..n]` are equal-length byte slices.
-    fn encode(self: *const RS, data: []const []const u8, out: [][]u8) void {
+    fn encode(self: *const RS, data: []const []const u8, out: [][]u8) !void {
         const sz = data[0].len;
-        // Data shards pass through (systematic)
         for (0..self.k) |i| @memcpy(out[i], data[i]);
-        // Parity shards = linear combination over GF(2^8)
-        for (self.k..self.n) |i| {
-            @memset(out[i], 0);
-            for (0..self.k) |j| {
-                const c = self.enc.get(i, j);
-                if (c == 0) continue;
-                if (c == 1) {
-                    for (0..sz) |p| out[i][p] ^= data[j][p];
-                } else {
-                    for (0..sz) |p| out[i][p] ^= gfMul(c, data[j][p]);
-                }
-            }
+
+        const m_par = self.m;
+        const min_parallel: usize = 16 * 1024;
+        if (m_par <= 1 or sz < min_parallel or builtin.single_threaded) {
+            for (self.k..self.n) |i| rsEncodeParityRow(self, data, out, sz, i);
+            return;
         }
+
+        const cpu = std.Thread.getCpuCount() catch 1;
+        const n_threads = @min(m_par, @max(1, cpu));
+        if (n_threads <= 1) {
+            for (self.k..self.n) |i| rsEncodeParityRow(self, data, out, sz, i);
+            return;
+        }
+
+        const threads = try self.alloc.alloc(std.Thread, n_threads);
+        defer self.alloc.free(threads);
+
+        var t: usize = 0;
+        while (t < n_threads) : (t += 1) {
+            const chunk = partitionChunk(m_par, n_threads, t);
+            const row_begin = self.k + chunk.start;
+            const row_end = self.k + chunk.end;
+            threads[t] = try std.Thread.spawn(.{}, rsEncodeParityRangeWorker, .{ self, data, out, sz, row_begin, row_end });
+        }
+        for (threads) |th| th.join();
     }
 
     /// Recover k original data shards from exactly k (index, shard) pairs.
@@ -225,31 +241,112 @@ const RS = struct {
         std.debug.assert(indices.len == self.k);
         const sz = shards[0].len;
 
-        // Build the k×k sub-matrix by picking the rows at `indices`
         var sub = try Matrix.create(alloc, self.k, self.k);
         defer sub.destroy();
         for (0..self.k) |i| {
             for (0..self.k) |j| sub.put(i, j, self.enc.get(indices[i], j));
         }
 
-        // Invert it — then `data = sub_inv × received`
         var sub_inv = try sub.invert(alloc);
         defer sub_inv.destroy();
 
-        for (0..self.k) |i| {
-            @memset(out[i], 0);
-            for (0..self.k) |j| {
-                const c = sub_inv.get(i, j);
-                if (c == 0) continue;
-                if (c == 1) {
-                    for (0..sz) |p| out[i][p] ^= shards[j][p];
-                } else {
-                    for (0..sz) |p| out[i][p] ^= gfMul(c, shards[j][p]);
-                }
+        const k_dim = self.k;
+        const min_parallel: usize = 16 * 1024;
+        if (k_dim <= 1 or sz < min_parallel or builtin.single_threaded) {
+            rsDecodeRecoverRows(self, &sub_inv, shards, out, sz, 0, k_dim);
+            return;
+        }
+
+        const cpu = std.Thread.getCpuCount() catch 1;
+        const n_threads = @min(k_dim, @max(1, cpu));
+        if (n_threads <= 1) {
+            rsDecodeRecoverRows(self, &sub_inv, shards, out, sz, 0, k_dim);
+            return;
+        }
+
+        const threads = try alloc.alloc(std.Thread, n_threads);
+        defer alloc.free(threads);
+
+        var tt: usize = 0;
+        while (tt < n_threads) : (tt += 1) {
+            const chunk = partitionChunk(k_dim, n_threads, tt);
+            threads[tt] = try std.Thread.spawn(.{}, rsDecodeRowRangeWorker, .{ self, &sub_inv, shards, out, sz, chunk.start, chunk.end });
+        }
+        for (threads) |th| th.join();
+    }
+};
+
+/// Split `count` items into `parts` contiguous index ranges; returns `[start, end)`.
+fn partitionChunk(count: usize, parts: usize, part_index: usize) struct { start: usize, end: usize } {
+    std.debug.assert(parts > 0);
+    std.debug.assert(part_index < parts);
+    const base = count / parts;
+    const rem = count % parts;
+    const start = part_index * base + @min(part_index, rem);
+    const end = start + base + @as(usize, if (part_index < rem) 1 else 0);
+    return .{ .start = start, .end = end };
+}
+
+fn rsEncodeParityRow(rs: *const RS, data: []const []const u8, out: [][]u8, sz: usize, i: usize) void {
+    @memset(out[i], 0);
+    for (0..rs.k) |j| {
+        const c = rs.enc.get(i, j);
+        if (c == 0) continue;
+        if (c == 1) {
+            for (0..sz) |p| out[i][p] ^= data[j][p];
+        } else {
+            for (0..sz) |p| out[i][p] ^= gfMul(c, data[j][p]);
+        }
+    }
+}
+
+fn rsEncodeParityRangeWorker(
+    rs: *const RS,
+    data: []const []const u8,
+    out: [][]u8,
+    sz: usize,
+    row_begin: usize,
+    row_end: usize,
+) void {
+    var i = row_begin;
+    while (i < row_end) : (i += 1) rsEncodeParityRow(rs, data, out, sz, i);
+}
+
+fn rsDecodeRecoverRows(
+    rs: *const RS,
+    sub_inv: *const Matrix,
+    shards: []const []const u8,
+    out: [][]u8,
+    sz: usize,
+    row_begin: usize,
+    row_end: usize,
+) void {
+    var i = row_begin;
+    while (i < row_end) : (i += 1) {
+        @memset(out[i], 0);
+        for (0..rs.k) |j| {
+            const c = sub_inv.get(i, j);
+            if (c == 0) continue;
+            if (c == 1) {
+                for (0..sz) |p| out[i][p] ^= shards[j][p];
+            } else {
+                for (0..sz) |p| out[i][p] ^= gfMul(c, shards[j][p]);
             }
         }
     }
-};
+}
+
+fn rsDecodeRowRangeWorker(
+    rs: *const RS,
+    sub_inv: *const Matrix,
+    shards: []const []const u8,
+    out: [][]u8,
+    sz: usize,
+    row_begin: usize,
+    row_end: usize,
+) void {
+    rsDecodeRecoverRows(rs, sub_inv, shards, out, sz, row_begin, row_end);
+}
 
 // ============================================================================
 // Shard file format
@@ -412,8 +509,8 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     const shard_sz  = (file_size + k - 1) / k; // ceiling division
     const padded_sz = shard_sz * k;
 
-    // Zero-padded buffer
-    var padded = try alloc.alloc(u8, padded_sz);
+    // Zero-padded buffer (aligned for hot XOR loops)
+    var padded = try alloc.alignedAlloc(u8, codec_align, padded_sz);
     defer alloc.free(padded);
     @memcpy(padded[0..file_size], raw);
     if (file_size < padded_sz) @memset(padded[file_size..], 0);
@@ -427,14 +524,14 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     const n = k + m;
     var out_bufs = try alloc.alloc([]u8, n);
     defer alloc.free(out_bufs);
-    for (0..n) |si| out_bufs[si] = try alloc.alloc(u8, shard_sz);
+    for (0..n) |si| out_bufs[si] = try alloc.alignedAlloc(u8, codec_align, shard_sz);
     defer for (out_bufs) |sb| alloc.free(sb);
 
     // ── Encode ───────────────────────────────────────────────────────────────
     gfInit();
     var rs = try RS.init(alloc, k, m);
     defer rs.deinit();
-    rs.encode(data_views, out_bufs);
+    try rs.encode(data_views, out_bufs);
 
     // ── Write shards ─────────────────────────────────────────────────────────
     try std.fs.cwd().makePath(out_dir);
@@ -561,7 +658,7 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
 
     var out_bufs = try alloc.alloc([]u8, k);
     defer alloc.free(out_bufs);
-    for (0..k) |i| out_bufs[i] = try alloc.alloc(u8, shard_sz);
+    for (0..k) |i| out_bufs[i] = try alloc.alignedAlloc(u8, codec_align, shard_sz);
     defer for (out_bufs) |sb| alloc.free(sb);
 
     gfInit();
@@ -571,7 +668,7 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
 
     // ── Reassemble and write ─────────────────────────────────────────────────
     const padded_sz = shard_sz * k;
-    var assembled = try alloc.alloc(u8, padded_sz);
+    var assembled = try alloc.alignedAlloc(u8, codec_align, padded_sz);
     defer alloc.free(assembled);
     for (0..k) |i| @memcpy(assembled[i * shard_sz .. (i + 1) * shard_sz], out_bufs[i]);
 
@@ -692,13 +789,13 @@ fn cmdVerify(alloc: Allocator, argv: []const []const u8) !void {
 
     var re_bufs = try alloc.alloc([]u8, n);
     defer alloc.free(re_bufs);
-    for (0..n) |i| re_bufs[i] = try alloc.alloc(u8, shard_sz);
+    for (0..n) |i| re_bufs[i] = try alloc.alignedAlloc(u8, codec_align, shard_sz);
     defer for (re_bufs) |rb| alloc.free(rb);
 
     gfInit();
     var rs = try RS.init(alloc, k, m);
     defer rs.deinit();
-    rs.encode(data_views, re_bufs);
+    try rs.encode(data_views, re_bufs);
 
     // Compare parity shards
     var ok = true;
@@ -888,7 +985,7 @@ test "RS encode + decode full round-trip" {
     for (0..n) |i| all_bufs[i] = try alloc.alloc(u8, sz);
     defer for (0..n) |i| alloc.free(all_bufs[i]);
 
-    rs.encode(&data_views, &all_bufs);
+    try rs.encode(&data_views, &all_bufs);
 
     // Decode using shards [0, 2, 5, 6]  (skip 1, 3, 4)
     const test_idx = [_]usize{ 0, 2, 5, 6 };
@@ -921,7 +1018,7 @@ test "RS single-byte file" {
     var all: [n][]u8 = undefined;
     for (0..n) |i| all[i] = try alloc.alloc(u8, 1);
     defer for (0..n) |i| alloc.free(all[i]);
-    rs.encode(&dv, &all);
+    try rs.encode(&dv, &all);
 
     // Recover using only parity shards [3, 4] + data shard [1]
     const idx = [_]usize{ 1, 3, 4 };
