@@ -7,6 +7,7 @@
 //   rs info   <shard> [shard …]
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 // ============================================================================
@@ -18,6 +19,8 @@ const GF_POLY: u16 = 0x11D;
 // Tables are filled once by gfInit() before any codec work.
 var gf_log: [256]u8 = [_]u8{0} ** 256;
 var gf_exp: [512]u8 = [_]u8{0} ** 512; // doubled so log sums need no mod
+/// gf_mul_lut[c][x] = gfMul(c, x) — speeds hot XOR–multiply chains vs log/exp each byte.
+var gf_mul_lut: [256][256]u8 = undefined;
 
 fn gfInit() void {
     var x: u16 = 1;
@@ -30,6 +33,14 @@ fn gfInit() void {
     }
     gf_exp[510] = gf_exp[0]; // safety sentinel
     // gf_log[0] is left as 0; callers must guard against zero inputs.
+
+    for (0..256) |ci| {
+        const c: u8 = @truncate(ci);
+        for (0..256) |xi| {
+            const xv: u8 = @truncate(xi);
+            gf_mul_lut[c][xv] = gfMul(c, xv);
+        }
+    }
 }
 
 inline fn gfMul(a: u8, b: u8) u8 {
@@ -40,6 +51,53 @@ inline fn gfMul(a: u8, b: u8) u8 {
 inline fn gfInv(a: u8) u8 {
     std.debug.assert(a != 0);
     return gf_exp[255 - @as(usize, gf_log[a])];
+}
+
+/// dst[i] ^= src[i]; vectorized XOR on wide chunks, tail scalar.
+fn xorSlice(dst: []u8, src: []const u8) void {
+    std.debug.assert(dst.len == src.len);
+    const len = dst.len;
+    var i: usize = 0;
+
+    const Vec = @Vector(64, u8);
+    const vec_bytes = @sizeOf(Vec);
+    while (i + vec_bytes <= len) : (i += vec_bytes) {
+        const s = src[i..][0..vec_bytes];
+        const d = dst[i..][0..vec_bytes];
+        const vs: Vec = @bitCast(s.*);
+        const vd: Vec = @bitCast(d.*);
+        d.* = @bitCast(vd ^ vs);
+    }
+    while (i + 8 <= len) : (i += 8) {
+        const xi = std.mem.readInt(u64, src[i..][0..8], .little);
+        const yi = std.mem.readInt(u64, dst[i..][0..8], .little);
+        std.mem.writeInt(u64, dst[i..][0..8], xi ^ yi, .little);
+    }
+    while (i < len) : (i += 1) dst[i] ^= src[i];
+}
+
+/// dst[i] ^= gfMul(c, src[i]); uses multiply LUT; c==1 uses xorSlice.
+fn gfXorMulConstSlice(dst: []u8, src: []const u8, c: u8) void {
+    if (c == 0) return;
+    if (c == 1) {
+        xorSlice(dst, src);
+        return;
+    }
+    const lut: *const [256]u8 = &gf_mul_lut[c];
+    var idx: usize = 0;
+    while (idx < dst.len) : (idx += 1) {
+        dst[idx] ^= lut[src[idx]];
+    }
+}
+
+fn partitionRange(len: usize, parts: usize, index: usize) struct { a: usize, b: usize } {
+    std.debug.assert(parts > 0);
+    std.debug.assert(index < parts);
+    const base = len / parts;
+    const rem = len % parts;
+    const a = index * base + @min(index, rem);
+    const b = a + base + @as(usize, if (index < rem) 1 else 0);
+    return .{ .a = a, .b = b };
 }
 
 // ============================================================================
@@ -154,6 +212,26 @@ const Matrix = struct {
 // Any k rows of a Vandermonde matrix over a field with distinct evaluation
 // points form an invertible sub-matrix, so any k-of-n subset works.
 
+const EncodeParityCtx = struct {
+    rs: *const RS,
+    data: []const []const u8,
+    out: [][]u8,
+    row_begin: usize,
+    row_end: usize,
+};
+
+fn encodeParityThread(ctx: EncodeParityCtx) void {
+    var i = ctx.row_begin;
+    while (i < ctx.row_end) : (i += 1) {
+        @memset(ctx.out[i], 0);
+        for (0..ctx.rs.k) |j| {
+            const c = ctx.rs.enc.get(i, j);
+            if (c == 0) continue;
+            gfXorMulConstSlice(ctx.out[i], ctx.data[j], c);
+        }
+    }
+}
+
 const RS = struct {
     k: usize,   // data shards
     m: usize,   // parity shards
@@ -194,23 +272,36 @@ const RS = struct {
 
     /// Encode k data shards into n shards.
     /// `data[0..k]` and `out[0..n]` are equal-length byte slices.
-    fn encode(self: *const RS, data: []const []const u8, out: [][]u8) void {
-        const sz = data[0].len;
-        // Data shards pass through (systematic)
+    fn encode(self: *const RS, data: []const []const u8, out: [][]u8) !void {
         for (0..self.k) |i| @memcpy(out[i], data[i]);
-        // Parity shards = linear combination over GF(2^8)
-        for (self.k..self.n) |i| {
-            @memset(out[i], 0);
-            for (0..self.k) |j| {
-                const c = self.enc.get(i, j);
-                if (c == 0) continue;
-                if (c == 1) {
-                    for (0..sz) |p| out[i][p] ^= data[j][p];
-                } else {
-                    for (0..sz) |p| out[i][p] ^= gfMul(c, data[j][p]);
-                }
-            }
+        const parity_rows = self.m;
+        if (parity_rows == 0) return;
+        if (builtin.single_threaded or parity_rows < 2) {
+            encodeParityThread(.{ .rs = self, .data = data, .out = out, .row_begin = self.k, .row_end = self.n });
+            return;
         }
+        const cpu = std.Thread.getCpuCount() catch 1;
+        const n_threads = @min(cpu, parity_rows);
+        if (n_threads <= 1) {
+            encodeParityThread(.{ .rs = self, .data = data, .out = out, .row_begin = self.k, .row_end = self.n });
+            return;
+        }
+        const threads = try self.alloc.alloc(std.Thread, n_threads);
+        defer self.alloc.free(threads);
+        var t: usize = 0;
+        while (t < n_threads) : (t += 1) {
+            const pr = partitionRange(parity_rows, n_threads, t);
+            const row_begin = self.k + pr.a;
+            const row_end = self.k + pr.b;
+            threads[t] = try std.Thread.spawn(.{}, encodeParityThread, .{@as(EncodeParityCtx, .{
+                .rs = self,
+                .data = data,
+                .out = out,
+                .row_begin = row_begin,
+                .row_end = row_end,
+            })});
+        }
+        for (threads) |th| th.join();
     }
 
     /// Recover k original data shards from exactly k (index, shard) pairs.
@@ -223,7 +314,6 @@ const RS = struct {
         out: [][]u8,
     ) !void {
         std.debug.assert(indices.len == self.k);
-        const sz = shards[0].len;
 
         // Build the k×k sub-matrix by picking the rows at `indices`
         var sub = try Matrix.create(alloc, self.k, self.k);
@@ -236,20 +326,97 @@ const RS = struct {
         var sub_inv = try sub.invert(alloc);
         defer sub_inv.destroy();
 
-        for (0..self.k) |i| {
-            @memset(out[i], 0);
-            for (0..self.k) |j| {
-                const c = sub_inv.get(i, j);
-                if (c == 0) continue;
-                if (c == 1) {
-                    for (0..sz) |p| out[i][p] ^= shards[j][p];
-                } else {
-                    for (0..sz) |p| out[i][p] ^= gfMul(c, shards[j][p]);
+        const k_rows = self.k;
+        if (builtin.single_threaded or k_rows < 2) {
+            decodeRecoverThread(.{
+                .sub_inv = &sub_inv,
+                .shards = shards,
+                .out = out,
+                .k = k_rows,
+                .row_begin = 0,
+                .row_end = k_rows,
+            });
+        } else {
+            const cpu = std.Thread.getCpuCount() catch 1;
+            const n_threads = @min(cpu, k_rows);
+            if (n_threads <= 1) {
+                decodeRecoverThread(.{
+                    .sub_inv = &sub_inv,
+                    .shards = shards,
+                    .out = out,
+                    .k = k_rows,
+                    .row_begin = 0,
+                    .row_end = k_rows,
+                });
+            } else {
+                const threads = try self.alloc.alloc(std.Thread, n_threads);
+                defer self.alloc.free(threads);
+                var t: usize = 0;
+                while (t < n_threads) : (t += 1) {
+                    const pr = partitionRange(k_rows, n_threads, t);
+                    threads[t] = try std.Thread.spawn(.{}, decodeRecoverThread, .{@as(DecodeRecoverCtx, .{
+                        .sub_inv = &sub_inv,
+                        .shards = shards,
+                        .out = out,
+                        .k = k_rows,
+                        .row_begin = pr.a,
+                        .row_end = pr.b,
+                    })});
                 }
+                for (threads) |th| th.join();
             }
         }
     }
 };
+
+const DecodeRecoverCtx = struct {
+    sub_inv: *const Matrix,
+    shards: []const []const u8,
+    out: [][]u8,
+    k: usize,
+    row_begin: usize,
+    row_end: usize,
+};
+
+fn decodeRecoverThread(ctx: DecodeRecoverCtx) void {
+    var i = ctx.row_begin;
+    while (i < ctx.row_end) : (i += 1) {
+        @memset(ctx.out[i], 0);
+        for (0..ctx.k) |j| {
+            const c = ctx.sub_inv.get(i, j);
+            if (c == 0) continue;
+            gfXorMulConstSlice(ctx.out[i], ctx.shards[j], c);
+        }
+    }
+}
+
+const ParityStripeCtx = struct {
+    rs: *const RS,
+    col: [][]u8,
+    out_par: [][]u8,
+    off_a: usize,
+    off_b: usize,
+    k: usize,
+    m: usize,
+};
+
+fn parityStripeOffRange(ctx: ParityStripeCtx) void {
+    const kk = ctx.k;
+    const mm = ctx.m;
+    for (ctx.off_a..ctx.off_b) |off| {
+        var tt: usize = 0;
+        while (tt < mm) : (tt += 1) {
+            const pi = kk + tt;
+            var acc: u8 = 0;
+            var jj: usize = 0;
+            while (jj < kk) : (jj += 1) {
+                const c = ctx.rs.enc.get(pi, jj);
+                if (c != 0) acc ^= gf_mul_lut[c][ctx.col[jj][off]];
+            }
+            ctx.out_par[tt][off] = acc;
+        }
+    }
+}
 
 // ============================================================================
 // Shard file format
@@ -425,17 +592,47 @@ fn encodeStreaming(
             try data_files[jj].seekTo(16 + @as(u64, @intCast(p)));
             _ = try data_files[jj].readAll(col[jj][0..csize]);
         }
-        for (0..csize) |off| {
-            var tt: usize = 0;
-            while (tt < m) : (tt += 1) {
-                const pi = k + tt;
-                var acc: u8 = 0;
-                var jj: usize = 0;
-                while (jj < k) : (jj += 1) {
-                    const c = rs.enc.get(pi, jj);
-                    if (c != 0) acc ^= gfMul(c, col[jj][off]);
+        const min_off_chunk: usize = 4096;
+        if (builtin.single_threaded or csize < min_off_chunk * 2) {
+            parityStripeOffRange(.{
+                .rs = &rs,
+                .col = col,
+                .out_par = out_par,
+                .off_a = 0,
+                .off_b = csize,
+                .k = k,
+                .m = m,
+            });
+        } else {
+            const cpu = std.Thread.getCpuCount() catch 1;
+            const n_threads = @min(cpu, @max(1, csize / min_off_chunk));
+            if (n_threads <= 1) {
+                parityStripeOffRange(.{
+                    .rs = &rs,
+                    .col = col,
+                    .out_par = out_par,
+                    .off_a = 0,
+                    .off_b = csize,
+                    .k = k,
+                    .m = m,
+                });
+            } else {
+                const threads = try alloc.alloc(std.Thread, n_threads);
+                defer alloc.free(threads);
+                var t: usize = 0;
+                while (t < n_threads) : (t += 1) {
+                    const pr = partitionRange(csize, n_threads, t);
+                    threads[t] = try std.Thread.spawn(.{}, parityStripeOffRange, .{@as(ParityStripeCtx, .{
+                        .rs = &rs,
+                        .col = col,
+                        .out_par = out_par,
+                        .off_a = pr.a,
+                        .off_b = pr.b,
+                        .k = k,
+                        .m = m,
+                    })});
                 }
-                out_par[tt][off] = acc;
+                for (threads) |th| th.join();
             }
         }
         for (0..m) |tt| {
@@ -670,7 +867,7 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     gfInit();
     var rs = try RS.init(alloc, k, m);
     defer rs.deinit();
-    rs.encode(data_views, out_bufs);
+    try rs.encode(data_views, out_bufs);
 
     var path_buf: [1024]u8 = undefined;
     try stdout.print("\n", .{});
@@ -957,7 +1154,7 @@ fn cmdVerify(alloc: Allocator, argv: []const []const u8) !void {
     gfInit();
     var rs = try RS.init(alloc, k, m);
     defer rs.deinit();
-    rs.encode(data_views, re_bufs);
+    try rs.encode(data_views, re_bufs);
 
     // Compare parity shards
     var ok = true;
@@ -1148,7 +1345,7 @@ test "RS encode + decode full round-trip" {
     for (0..n) |i| all_bufs[i] = try alloc.alloc(u8, sz);
     defer for (0..n) |i| alloc.free(all_bufs[i]);
 
-    rs.encode(&data_views, &all_bufs);
+    try rs.encode(&data_views, &all_bufs);
 
     // Decode using shards [0, 2, 5, 6]  (skip 1, 3, 4)
     const test_idx = [_]usize{ 0, 2, 5, 6 };
@@ -1181,7 +1378,7 @@ test "RS single-byte file" {
     var all: [n][]u8 = undefined;
     for (0..n) |i| all[i] = try alloc.alloc(u8, 1);
     defer for (0..n) |i| alloc.free(all[i]);
-    rs.encode(&dv, &all);
+    try rs.encode(&dv, &all);
 
     // Recover using only parity shards [3, 4] + data shard [1]
     const idx = [_]usize{ 1, 3, 4 };

@@ -8,10 +8,9 @@ dd if=/dev/zero of=testfile.bin bs=1M count=20
 ./zig-out/bin/rs encode testfile.bin --data 4 --parity 2 --out shards/
 ./zig-out/bin/rs decode testfile.bin.recovered \
   shards/testfile.bin.shard000 shards/testfile.bin.shard001 shards/testfile.bin.shard002 shards/testfile.bin.shard005
+sha256sum testfile.bin && sha256sum testfile.bin.recovered
 cmp -s testfile.bin testfile.bin.recovered
 
-# Stdin example (spools to a temp file under --out, then encodes):
-# dd if=/dev/zero bs=1G count=2 | ./zig-out/bin/rs encode - --data 4 --parity 2 --out shards/
-
+# cleanup
 rm -f testfile.bin testfile.bin.recovered
 rm -rf shards/
