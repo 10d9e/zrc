@@ -191,7 +191,6 @@ const Matrix = struct {
         }
         return res;
     }
-
 };
 
 // ============================================================================
@@ -233,15 +232,15 @@ fn encodeParityThread(ctx: EncodeParityCtx) void {
 }
 
 const RS = struct {
-    k: usize,   // data shards
-    m: usize,   // parity shards
-    n: usize,   // k + m total shards
+    k: usize, // data shards
+    m: usize, // parity shards
+    n: usize, // k + m total shards
     enc: Matrix, // (n × k) systematic encoding matrix
     alloc: Allocator,
 
     fn init(alloc: Allocator, k: usize, m: usize) !RS {
         const n = k + m;
-        if (n > 255) return error.TooManyShards;   // GF(2^8) has 255 nonzero elements
+        if (n > 255) return error.TooManyShards; // GF(2^8) has 255 nonzero elements
         if (k == 0 or m == 0) return error.InvalidParams;
 
         // Vandermonde matrix V (n × k), evaluation points α^0, α^1, …, α^(n-1)
@@ -509,8 +508,7 @@ fn encodeStreaming(
     defer for (0..k) |j| data_files[j].close();
 
     for (0..k) |j| {
-        const shard_path = try std.fmt.bufPrint(
-            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, j });
+        const shard_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, j });
         data_files[j] = try std.fs.cwd().createFile(shard_path, .{});
         const hdr = ShardHeader{
             .k = @intCast(k),
@@ -543,8 +541,7 @@ fn encodeStreaming(
     // `createFile` may be write-only; pass 2 must read data shards — reopen for reading.
     for (0..k) |jj| {
         data_files[jj].close();
-        const shard_path = try std.fmt.bufPrint(
-            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, jj });
+        const shard_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, jj });
         data_files[jj] = try std.fs.cwd().openFile(shard_path, .{});
     }
 
@@ -554,8 +551,7 @@ fn encodeStreaming(
 
     for (0..m) |t| {
         const pi = k + t;
-        const shard_path = try std.fmt.bufPrint(
-            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, pi });
+        const shard_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, pi });
         parity_files[t] = try std.fs.cwd().createFile(shard_path, .{});
         const hdr = ShardHeader{
             .k = @intCast(k),
@@ -643,8 +639,7 @@ fn encodeStreaming(
 
     try stdout.print("\n", .{});
     for (0..n) |si| {
-        const shard_path = try std.fmt.bufPrint(
-            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, si });
+        const shard_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, si });
         const kind = if (si < k) "data  " else "parity";
         try stdout.print("  [{s}] {s}\n", .{ kind, shard_path });
     }
@@ -660,9 +655,12 @@ fn encodeStreaming(
     , .{
         base,
         fmtSize(&sz_buf1, file_size),
-        n, k, m,
+        n,
+        k,
+        m,
         fmtSize(&sz_buf2, shard_sz),
-        k, n,
+        k,
+        n,
     });
 }
 
@@ -745,8 +743,7 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     var stdout: *std.Io.Writer = &stdout_file.interface;
 
     if (argv.len == 0) {
-        try stderr.interface.print(
-            "Usage: rs encode <file|-> [--data K] [--parity M] [--out DIR]\n   (- reads stdin; spools then encodes; >1GiB files use streaming)\n", .{});
+        try stderr.interface.print("Usage: rs encode <file|-> [--data K] [--parity M] [--out DIR]\n   (- reads stdin; spools then encodes; >1GiB files use streaming)\n", .{});
         return error.InvalidArgs;
     }
 
@@ -792,8 +789,7 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     }
 
     if (k < 1 or m < 1 or k + m > 255) {
-        try stderr.interface.print(
-            "Invalid: k={d}, m={d} — need k≥1, m≥1, k+m≤255\n", .{ k, m });
+        try stderr.interface.print("Invalid: k={d}, m={d} — need k≥1, m≥1, k+m≤255\n", .{ k, m });
         return error.InvalidArgs;
     }
 
@@ -872,12 +868,11 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     var path_buf: [1024]u8 = undefined;
     try stdout.print("\n", .{});
     for (0..n) |si| {
-        const shard_path = try std.fmt.bufPrint(
-            &path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, si });
+        const shard_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.shard{d:0>3}", .{ out_dir, base, si });
         const hdr = ShardHeader{
-            .k         = @intCast(k),
-            .m         = @intCast(m),
-            .index     = @intCast(si),
+            .k = @intCast(k),
+            .m = @intCast(m),
+            .index = @intCast(si),
             .file_size = file_size,
         };
         try writeShardFile(shard_path, hdr, out_bufs[si]);
@@ -896,9 +891,12 @@ fn cmdEncode(alloc: Allocator, argv: []const []const u8) !void {
     , .{
         label,
         fmtSize(&sz_buf1, file_size),
-        n, k, m,
+        n,
+        k,
+        m,
         fmtSize(&sz_buf2, shard_sz),
-        k, n,
+        k,
+        n,
     });
 }
 
@@ -911,10 +909,9 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
     var stdout = std.fs.File.stdout().writer(&.{});
 
     if (argv.len < 2) {
-        try stderr.interface.print(
-            "Usage: rs decode <output_file> <shard|-> [shard …]\n" ++
-                "  Last arg may be paths to k shards, or a lone '-' to read k\n" ++
-                "  concatenated shard files from stdin (any order; each has a header).\n", .{});
+        try stderr.interface.print("Usage: rs decode <output_file> <shard|-> [shard …]\n" ++
+            "  Last arg may be paths to k shards, or a lone '-' to read k\n" ++
+            "  concatenated shard files from stdin (any order; each has a header).\n", .{});
         return error.InvalidArgs;
     }
 
@@ -968,20 +965,17 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
 
     for (shards[1..n_read], 1..) |s, idx| {
         if (s.hdr.k != h0.k or s.hdr.m != h0.m) {
-            try stderr.interface.print(
-                "Shard #{d} has different k/m params than shard #0.\n", .{idx});
+            try stderr.interface.print("Shard #{d} has different k/m params than shard #0.\n", .{idx});
             return error.ShardMismatch;
         }
         if (s.hdr.file_size != h0.file_size) {
-            try stderr.interface.print(
-                "Shard #{d} reports a different original file size.\n", .{idx});
+            try stderr.interface.print("Shard #{d} reports a different original file size.\n", .{idx});
             return error.ShardMismatch;
         }
     }
 
     if (n_read < k) {
-        try stderr.interface.print(
-            "Need at least {d} shards; only {d} provided.\n", .{ k, n_read });
+        try stderr.interface.print("Need at least {d} shards; only {d} provided.\n", .{ k, n_read });
         return error.NotEnoughShards;
     }
 
@@ -997,9 +991,7 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
     for (0..k) |a| {
         for (a + 1..k) |b| {
             if (shards[a].hdr.index == shards[b].hdr.index) {
-                try stderr.interface.print(
-                    "Duplicate shard index {d} at positions {d} and {d}.\n",
-                    .{ shards[a].hdr.index, a, b });
+                try stderr.interface.print("Duplicate shard index {d} at positions {d} and {d}.\n", .{ shards[a].hdr.index, a, b });
                 return error.DuplicateShardIndex;
             }
         }
@@ -1012,7 +1004,7 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
     defer alloc.free(recv);
     for (0..k) |i| {
         indices[i] = shards[i].hdr.index;
-        recv[i]    = shards[i].data;
+        recv[i] = shards[i].data;
     }
 
     var out_bufs = try alloc.alloc([]u8, k);
@@ -1040,11 +1032,9 @@ fn cmdDecode(alloc: Allocator, argv: []const []const u8) !void {
 
     var sz_buf: [32]u8 = undefined;
     if (n_read > k) {
-        try stdout.interface.print(
-            "Note: {d} shards provided; using first {d}.\n", .{ n_read, k });
+        try stdout.interface.print("Note: {d} shards provided; using first {d}.\n", .{ n_read, k });
     }
-    try stdout.interface.print("Decoded '{s}' ({s}).\n",
-        .{ dst_path, fmtSize(&sz_buf, actual) });
+    try stdout.interface.print("Decoded '{s}' ({s}).\n", .{ dst_path, fmtSize(&sz_buf, actual) });
 }
 
 // ============================================================================
@@ -1067,7 +1057,7 @@ fn cmdInfo(alloc: Allocator, argv: []const []const u8) !void {
         };
         defer s.deinit();
         const total: usize = @as(usize, s.hdr.k) + @as(usize, s.hdr.m);
-        const kind  = if (s.hdr.index < s.hdr.k) "data" else "parity";
+        const kind = if (s.hdr.index < s.hdr.k) "data" else "parity";
         var sb1: [32]u8 = undefined;
         var sb2: [32]u8 = undefined;
         try stdout.interface.print(
@@ -1079,8 +1069,13 @@ fn cmdInfo(alloc: Allocator, argv: []const []const u8) !void {
             \\
         , .{
             p,
-            s.hdr.index, total - 1, kind,
-            s.hdr.k, total, s.hdr.k, total,
+            s.hdr.index,
+            total - 1,
+            kind,
+            s.hdr.k,
+            total,
+            s.hdr.k,
+            total,
             fmtSize(&sb1, s.data.len),
             fmtSize(&sb2, s.hdr.file_size),
         });
@@ -1096,8 +1091,7 @@ fn cmdVerify(alloc: Allocator, argv: []const []const u8) !void {
     var stdout = std.fs.File.stdout().writer(&.{});
 
     if (argv.len == 0) {
-        try stderr.interface.print(
-            "Usage: rs verify <shard0> <shard1> …  (provide ALL n shards)\n", .{});
+        try stderr.interface.print("Usage: rs verify <shard0> <shard1> …  (provide ALL n shards)\n", .{});
         return error.InvalidArgs;
     }
 
@@ -1115,7 +1109,7 @@ fn cmdVerify(alloc: Allocator, argv: []const []const u8) !void {
         n_read += 1;
     }
 
-    const h0    = shards[0].hdr;
+    const h0 = shards[0].hdr;
     const k: usize = h0.k;
     const m: usize = h0.m;
     const n: usize = k + m;
@@ -1232,7 +1226,7 @@ pub fn main() !void {
         return;
     }
 
-    const cmd  = args[0];
+    const cmd = args[0];
     const rest = if (args.len > 1) args[1..] else args[0..0];
 
     if (std.mem.eql(u8, cmd, "encode")) {
@@ -1256,8 +1250,8 @@ pub fn main() !void {
             std.process.exit(1);
         };
     } else if (std.mem.eql(u8, cmd, "help") or
-               std.mem.eql(u8, cmd, "--help") or
-               std.mem.eql(u8, cmd, "-h"))
+        std.mem.eql(u8, cmd, "--help") or
+        std.mem.eql(u8, cmd, "-h"))
     {
         try stdout.interface.print("{s}\n", .{HELP});
     } else {
@@ -1284,11 +1278,11 @@ test "GF mul commutativity and identity" {
 
 test "GF distributivity" {
     gfInit();
-    const a: u8 = 77; const b: u8 = 133; const c: u8 = 200;
+    const a: u8 = 77;
+    const b: u8 = 133;
+    const c: u8 = 200;
     // a*(b XOR c) == a*b XOR a*c
-    try std.testing.expectEqual(
-        gfMul(a, b ^ c),
-        gfMul(a, b) ^ gfMul(a, c));
+    try std.testing.expectEqual(gfMul(a, b ^ c), gfMul(a, b) ^ gfMul(a, c));
 }
 
 test "matrix invert round-trip" {
@@ -1297,9 +1291,15 @@ test "matrix invert round-trip" {
     // Build identity-like matrix and invert it
     var m = try Matrix.create(alloc, 3, 3);
     defer m.destroy();
-    m.put(0,0,1); m.put(0,1,0); m.put(0,2,0);
-    m.put(1,0,0); m.put(1,1,2); m.put(1,2,0);
-    m.put(2,0,0); m.put(2,1,0); m.put(2,2,4);
+    m.put(0, 0, 1);
+    m.put(0, 1, 0);
+    m.put(0, 2, 0);
+    m.put(1, 0, 0);
+    m.put(1, 1, 2);
+    m.put(1, 2, 0);
+    m.put(2, 0, 0);
+    m.put(2, 1, 0);
+    m.put(2, 2, 4);
     var inv = try m.invert(alloc);
     defer inv.destroy();
     var prod = try m.mul(&inv, alloc);
@@ -1313,7 +1313,8 @@ test "matrix invert round-trip" {
 test "RS systematic property" {
     gfInit();
     const alloc = std.testing.allocator;
-    const k: usize = 4; const m: usize = 3;
+    const k: usize = 4;
+    const m: usize = 3;
     var rs = try RS.init(alloc, k, m);
     defer rs.deinit();
     // First k rows of enc must equal identity
@@ -1328,7 +1329,9 @@ test "RS systematic property" {
 test "RS encode + decode full round-trip" {
     gfInit();
     const alloc = std.testing.allocator;
-    const k: usize = 4; const m: usize = 3; const n = k + m;
+    const k: usize = 4;
+    const m: usize = 3;
+    const n = k + m;
     const sz: usize = 64;
 
     var rs = try RS.init(alloc, k, m);
@@ -1336,7 +1339,9 @@ test "RS encode + decode full round-trip" {
 
     // Create deterministic data shards
     var data_mem: [k][sz]u8 = undefined;
-    for (0..k) |i| for (0..sz) |p| { data_mem[i][p] = @intCast((i * 17 + p * 7) % 251); };
+    for (0..k) |i| for (0..sz) |p| {
+        data_mem[i][p] = @intCast((i * 17 + p * 7) % 251);
+    };
     var data_views: [k][]const u8 = undefined;
     for (0..k) |i| data_views[i] = &data_mem[i];
 
@@ -1366,7 +1371,9 @@ test "RS encode + decode full round-trip" {
 test "RS single-byte file" {
     gfInit();
     const alloc = std.testing.allocator;
-    const k: usize = 3; const m: usize = 2; const n = k + m;
+    const k: usize = 3;
+    const m: usize = 2;
+    const n = k + m;
     var rs = try RS.init(alloc, k, m);
     defer rs.deinit();
 
