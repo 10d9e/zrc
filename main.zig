@@ -484,6 +484,117 @@ fn writeZeroPad(out: std.fs.File, len: usize, buf: []u8) !void {
     }
 }
 
+/// First error from concurrent I/O workers (streaming encode).
+const IoThreadErr = struct {
+    mu: std.Thread.Mutex = .{},
+    e: ?anyerror = null,
+
+    fn record(self: *IoThreadErr, err: anyerror) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.e == null) self.e = err;
+    }
+};
+
+fn copyPreadToFile(out: std.fs.File, buf: []u8, in: std.fs.File, file_off: u64, count: u64) !void {
+    var left = count;
+    var off = file_off;
+    while (left > 0) {
+        const n: usize = @intCast(@min(left, buf.len));
+        const got = try in.preadAll(buf[0..n], off);
+        if (got != n) return error.UnexpectedEndOfFile;
+        try out.writeAll(buf[0..n]);
+        left -= n;
+        off += n;
+    }
+}
+
+fn pass1WriteDataShard(
+    in: std.fs.File,
+    out: std.fs.File,
+    copy_buf: []u8,
+    j: usize,
+    file_size: u64,
+    shard_sz: usize,
+    shard_sz_u64: u64,
+) !void {
+    const base_off: u64 = @as(u64, @intCast(j)) * shard_sz_u64;
+    if (base_off >= file_size) {
+        try writeZeroPad(out, shard_sz, copy_buf);
+        return;
+    }
+    const take: u64 = @min(shard_sz_u64, file_size - base_off);
+    try copyPreadToFile(out, copy_buf, in, base_off, take);
+    if (take < shard_sz_u64) {
+        try writeZeroPad(out, @intCast(shard_sz_u64 - take), copy_buf);
+    }
+}
+
+const Pass1StripedCtx = struct {
+    in: std.fs.File,
+    files: [*]std.fs.File,
+    file_size: u64,
+    shard_sz: usize,
+    shard_sz_u64: u64,
+    k: usize,
+    w: usize,
+    nw: usize,
+    buf: []u8,
+    err: *IoThreadErr,
+
+    fn threadMain(ctx: Pass1StripedCtx) void {
+        var jj = ctx.w;
+        while (jj < ctx.k) : (jj += ctx.nw) {
+            pass1WriteDataShard(ctx.in, ctx.files[jj], ctx.buf, jj, ctx.file_size, ctx.shard_sz, ctx.shard_sz_u64) catch |e| {
+                ctx.err.record(e);
+                return;
+            };
+        }
+    }
+};
+
+const ColReadStripedCtx = struct {
+    files: [*]std.fs.File,
+    col: [][]u8,
+    p: usize,
+    csize: usize,
+    k: usize,
+    w: usize,
+    nw: usize,
+    err: *IoThreadErr,
+
+    fn threadMain(ctx: ColReadStripedCtx) void {
+        const read_off = 16 + @as(u64, @intCast(ctx.p));
+        var jj = ctx.w;
+        while (jj < ctx.k) : (jj += ctx.nw) {
+            _ = ctx.files[jj].preadAll(ctx.col[jj][0..ctx.csize], read_off) catch |e| {
+                ctx.err.record(e);
+                return;
+            };
+        }
+    }
+};
+
+const ParityWriteStripedCtx = struct {
+    files: [*]std.fs.File,
+    out_par: [][]u8,
+    csize: usize,
+    m: usize,
+    w: usize,
+    nw: usize,
+    err: *IoThreadErr,
+
+    fn threadMain(ctx: ParityWriteStripedCtx) void {
+        var tt = ctx.w;
+        while (tt < ctx.m) : (tt += ctx.nw) {
+            ctx.files[tt].writeAll(ctx.out_par[tt][0..ctx.csize]) catch |e| {
+                ctx.err.record(e);
+                return;
+            };
+        }
+    }
+};
+
 /// Pass 1: split input into k data shard files (with headers). Pass 2: derive parity shards.
 fn encodeStreaming(
     alloc: Allocator,
@@ -522,22 +633,37 @@ fn encodeStreaming(
         try writeShardHeader(&w, hdr);
     }
 
-    const copy_buf = try alloc.alloc(u8, stream_chunk);
-    defer alloc.free(copy_buf);
-
-    var j: usize = 0;
-    while (j < k) : (j += 1) {
-        const base_off: u64 = @as(u64, @intCast(j)) * shard_sz_u64;
-        if (base_off >= file_size) {
-            try writeZeroPad(data_files[j], shard_sz, copy_buf);
-            continue;
+    if (builtin.single_threaded or k == 1) {
+        const copy_buf = try alloc.alloc(u8, stream_chunk);
+        defer alloc.free(copy_buf);
+        for (0..k) |j| {
+            try pass1WriteDataShard(in.*, data_files[j], copy_buf, j, file_size, shard_sz, shard_sz_u64);
         }
-        const take: u64 = @min(shard_sz_u64, file_size - base_off);
-        try in.seekTo(base_off);
-        try copyFileBytes(data_files[j], copy_buf, in, take);
-        if (take < shard_sz_u64) {
-            try writeZeroPad(data_files[j], @intCast(shard_sz_u64 - take), copy_buf);
+    } else {
+        const cpu = std.Thread.getCpuCount() catch 1;
+        const nw = @min(cpu, k);
+        const pass1_buf = try alloc.alloc(u8, nw * stream_chunk);
+        defer alloc.free(pass1_buf);
+        var io_err = IoThreadErr{};
+        const threads = try alloc.alloc(std.Thread, nw);
+        defer alloc.free(threads);
+        var w: usize = 0;
+        while (w < nw) : (w += 1) {
+            threads[w] = try std.Thread.spawn(.{}, Pass1StripedCtx.threadMain, .{Pass1StripedCtx{
+                .in = in.*,
+                .files = data_files[0..k].ptr,
+                .file_size = file_size,
+                .shard_sz = shard_sz,
+                .shard_sz_u64 = shard_sz_u64,
+                .k = k,
+                .w = w,
+                .nw = nw,
+                .buf = pass1_buf[w * stream_chunk ..][0..stream_chunk],
+                .err = &io_err,
+            }});
         }
+        for (threads) |th| th.join();
+        if (io_err.e) |e| return e;
     }
 
     // `createFile` may be write-only; pass 2 must read data shards — reopen for reading.
@@ -586,9 +712,32 @@ fn encodeStreaming(
     var p: usize = 0;
     while (p < shard_sz) {
         const csize: usize = @min(stream_chunk, shard_sz - p);
-        for (0..k) |jj| {
-            try data_files[jj].seekTo(16 + @as(u64, @intCast(p)));
-            _ = try data_files[jj].readAll(col[jj][0..csize]);
+        if (!builtin.single_threaded and k > 1) {
+            const cpu = std.Thread.getCpuCount() catch 1;
+            const nw = @min(cpu, k);
+            var io_err = IoThreadErr{};
+            const threads = try alloc.alloc(std.Thread, nw);
+            defer alloc.free(threads);
+            var w: usize = 0;
+            while (w < nw) : (w += 1) {
+                threads[w] = try std.Thread.spawn(.{}, ColReadStripedCtx.threadMain, .{ColReadStripedCtx{
+                    .files = data_files[0..k].ptr,
+                    .col = col,
+                    .p = p,
+                    .csize = csize,
+                    .k = k,
+                    .w = w,
+                    .nw = nw,
+                    .err = &io_err,
+                }});
+            }
+            for (threads) |th| th.join();
+            if (io_err.e) |e| return e;
+        } else {
+            const read_off = 16 + @as(u64, @intCast(p));
+            for (0..k) |jj| {
+                _ = try data_files[jj].preadAll(col[jj][0..csize], read_off);
+            }
         }
         const min_off_chunk: usize = 4096;
         if (builtin.single_threaded or csize < min_off_chunk * 2) {
@@ -633,8 +782,30 @@ fn encodeStreaming(
                 for (threads) |th| th.join();
             }
         }
-        for (0..m) |tt| {
-            try parity_files[tt].writeAll(out_par[tt][0..csize]);
+        if (!builtin.single_threaded and m > 1) {
+            const cpu = std.Thread.getCpuCount() catch 1;
+            const nw = @min(cpu, m);
+            var io_err = IoThreadErr{};
+            const threads = try alloc.alloc(std.Thread, nw);
+            defer alloc.free(threads);
+            var w: usize = 0;
+            while (w < nw) : (w += 1) {
+                threads[w] = try std.Thread.spawn(.{}, ParityWriteStripedCtx.threadMain, .{ParityWriteStripedCtx{
+                    .files = parity_files[0..m].ptr,
+                    .out_par = out_par,
+                    .csize = csize,
+                    .m = m,
+                    .w = w,
+                    .nw = nw,
+                    .err = &io_err,
+                }});
+            }
+            for (threads) |th| th.join();
+            if (io_err.e) |e| return e;
+        } else {
+            for (0..m) |tt| {
+                try parity_files[tt].writeAll(out_par[tt][0..csize]);
+            }
         }
         p += csize;
     }
