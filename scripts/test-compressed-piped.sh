@@ -11,7 +11,8 @@ dd if=/dev/zero of=testfile.bin bs=1G count=5
 
 TIMEFORMAT=$'encode: %R s wall (%U s user, %S s sys)\n'
 echo "Timing stdin → gzip → encode (spool + shard write)…"
-time gzip -c testfile.bin | ./zig-out/bin/rs encode - --data 4 --parity 2 --out shards/
+
+time gzip -1 -c testfile.bin | ./zig-out/bin/rs encode - --data 4 --parity 2 --out shards/
 
 TIMEFORMAT=$'decode | gunzip: %R s wall (%U s user, %S s sys)\n'
 echo "Timing concat shards → decode (stdout) | gunzip → plaintext…"
