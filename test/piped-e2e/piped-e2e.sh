@@ -20,7 +20,7 @@ usage() {
 [[ $# -ge 2 ]] || usage
 K="$1"
 M="$2"
-SIZE_GIB="${3:-${SIZE_GIB:-5}}"
+SIZE_GIB="${3:-${SIZE_GIB:-1}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
