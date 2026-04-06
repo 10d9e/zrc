@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
     const e2e_quick = b.option(bool, "e2e-quick", "e2e: only 10 MiB and 100 MiB") orelse false;
 
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("main.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -26,7 +26,7 @@ pub fn build(b: *std.Build) void {
 
     // zig build test
     const test_mod = b.createModule(.{
-        .root_source_file = b.path("main.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
