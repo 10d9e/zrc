@@ -1,4 +1,4 @@
-# rs — reed-solomon erasure codec
+# zrs — reed-solomon erasure codec
 
 **Latest release: [v0.1.1](CHANGELOG.md)** — `rs version` / `rs --version`
 
